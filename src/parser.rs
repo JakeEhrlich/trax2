@@ -612,6 +612,14 @@ fn convert_single_instruction(
         WI::F32Div => { builder.emit(Instruction::Binary { op: BinaryOp::Div, typ: NumberType::F32 }); }
         WI::F32Neg => { builder.emit(Instruction::Unary { op: UnaryOp::Neg, typ: NumberType::F32 }); }
         WI::F32Abs => { builder.emit(Instruction::Unary { op: UnaryOp::Abs, typ: NumberType::F32 }); }
+        WI::F32Sqrt => { builder.emit(Instruction::Unary { op: UnaryOp::Sqrt, typ: NumberType::F32 }); }
+        WI::F32Ceil => { builder.emit(Instruction::Unary { op: UnaryOp::Ceil, typ: NumberType::F32 }); }
+        WI::F32Floor => { builder.emit(Instruction::Unary { op: UnaryOp::Floor, typ: NumberType::F32 }); }
+        WI::F32Trunc => { builder.emit(Instruction::Unary { op: UnaryOp::Trunc, typ: NumberType::F32 }); }
+        WI::F32Nearest => { builder.emit(Instruction::Unary { op: UnaryOp::Nearest, typ: NumberType::F32 }); }
+        WI::F32Min => { builder.emit(Instruction::Binary { op: BinaryOp::Min, typ: NumberType::F32 }); }
+        WI::F32Max => { builder.emit(Instruction::Binary { op: BinaryOp::Max, typ: NumberType::F32 }); }
+        WI::F32Copysign => { builder.emit(Instruction::Binary { op: BinaryOp::Copysign, typ: NumberType::F32 }); }
         WI::F32Eq => { builder.emit(Instruction::Compare { op: CompareOp::Eq, typ: NumberType::F32 }); }
         WI::F32Ne => { builder.emit(Instruction::Compare { op: CompareOp::Ne, typ: NumberType::F32 }); }
         WI::F32Lt => { builder.emit(Instruction::Compare { op: CompareOp::Lt, typ: NumberType::F32 }); }
@@ -627,6 +635,14 @@ fn convert_single_instruction(
         WI::F64Div => { builder.emit(Instruction::Binary { op: BinaryOp::Div, typ: NumberType::F64 }); }
         WI::F64Neg => { builder.emit(Instruction::Unary { op: UnaryOp::Neg, typ: NumberType::F64 }); }
         WI::F64Abs => { builder.emit(Instruction::Unary { op: UnaryOp::Abs, typ: NumberType::F64 }); }
+        WI::F64Sqrt => { builder.emit(Instruction::Unary { op: UnaryOp::Sqrt, typ: NumberType::F64 }); }
+        WI::F64Ceil => { builder.emit(Instruction::Unary { op: UnaryOp::Ceil, typ: NumberType::F64 }); }
+        WI::F64Floor => { builder.emit(Instruction::Unary { op: UnaryOp::Floor, typ: NumberType::F64 }); }
+        WI::F64Trunc => { builder.emit(Instruction::Unary { op: UnaryOp::Trunc, typ: NumberType::F64 }); }
+        WI::F64Nearest => { builder.emit(Instruction::Unary { op: UnaryOp::Nearest, typ: NumberType::F64 }); }
+        WI::F64Min => { builder.emit(Instruction::Binary { op: BinaryOp::Min, typ: NumberType::F64 }); }
+        WI::F64Max => { builder.emit(Instruction::Binary { op: BinaryOp::Max, typ: NumberType::F64 }); }
+        WI::F64Copysign => { builder.emit(Instruction::Binary { op: BinaryOp::Copysign, typ: NumberType::F64 }); }
         WI::F64Eq => { builder.emit(Instruction::Compare { op: CompareOp::Eq, typ: NumberType::F64 }); }
         WI::F64Ne => { builder.emit(Instruction::Compare { op: CompareOp::Ne, typ: NumberType::F64 }); }
         WI::F64Lt => { builder.emit(Instruction::Compare { op: CompareOp::Lt, typ: NumberType::F64 }); }
@@ -783,11 +799,13 @@ fn convert_core_ret(arg: &wast::core::WastRetCore) -> Option<Value> {
         wast::core::WastRetCore::I64(v) => Some(Value::I64(*v)),
         wast::core::WastRetCore::F32(v) => match v {
             wast::core::NanPattern::Value(f) => Some(Value::F32(f32::from_bits(f.bits))),
-            _ => None, // Skip NaN patterns for now
+            wast::core::NanPattern::CanonicalNan => Some(Value::F32(f32::NAN)),
+            wast::core::NanPattern::ArithmeticNan => Some(Value::F32(f32::NAN)),
         },
         wast::core::WastRetCore::F64(v) => match v {
             wast::core::NanPattern::Value(f) => Some(Value::F64(f64::from_bits(f.bits))),
-            _ => None,
+            wast::core::NanPattern::CanonicalNan => Some(Value::F64(f64::NAN)),
+            wast::core::NanPattern::ArithmeticNan => Some(Value::F64(f64::NAN)),
         },
         _ => None,
     }

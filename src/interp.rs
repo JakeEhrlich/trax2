@@ -544,6 +544,122 @@ impl Interpreter for ModuleInterpreter {
 }
 
 // ============================================================================
+// Helper functions for WASM float semantics
+// ============================================================================
+
+/// WASM nearest for f32 - rounds to nearest, ties to even
+fn wasm_nearest_f32(x: f32) -> f32 {
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        return x;
+    }
+    let rounded = x.round();
+    // Check if we're exactly at a .5 boundary
+    let diff = (x - rounded).abs();
+    if diff == 0.0 {
+        rounded
+    } else if (x - x.floor()).abs() == 0.5 {
+        // Ties to even
+        let floor = x.floor();
+        let ceil = x.ceil();
+        if (floor as i32) % 2 == 0 {
+            floor
+        } else {
+            ceil
+        }
+    } else {
+        rounded
+    }
+}
+
+/// WASM nearest for f64 - rounds to nearest, ties to even
+fn wasm_nearest_f64(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        return x;
+    }
+    let rounded = x.round();
+    // Check if we're exactly at a .5 boundary
+    let diff = (x - rounded).abs();
+    if diff == 0.0 {
+        rounded
+    } else if (x - x.floor()).abs() == 0.5 {
+        // Ties to even
+        let floor = x.floor();
+        let ceil = x.ceil();
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            ceil
+        }
+    } else {
+        rounded
+    }
+}
+
+/// WASM min for f32 - propagates NaN, returns -0 if either is -0 and other is +0
+fn wasm_min_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == 0.0 && b == 0.0 {
+        // Handle signed zero
+        if a.to_bits() == 0x8000_0000 || b.to_bits() == 0x8000_0000 {
+            -0.0_f32
+        } else {
+            0.0_f32
+        }
+    } else {
+        a.min(b)
+    }
+}
+
+/// WASM min for f64 - propagates NaN, returns -0 if either is -0 and other is +0
+fn wasm_min_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == 0.0 && b == 0.0 {
+        // Handle signed zero
+        if a.to_bits() == 0x8000_0000_0000_0000 || b.to_bits() == 0x8000_0000_0000_0000 {
+            -0.0_f64
+        } else {
+            0.0_f64
+        }
+    } else {
+        a.min(b)
+    }
+}
+
+/// WASM max for f32 - propagates NaN, returns +0 if one is +0 and other is -0
+fn wasm_max_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == 0.0 && b == 0.0 {
+        // Handle signed zero
+        if a.to_bits() == 0 || b.to_bits() == 0 {
+            0.0_f32
+        } else {
+            -0.0_f32
+        }
+    } else {
+        a.max(b)
+    }
+}
+
+/// WASM max for f64 - propagates NaN, returns +0 if one is +0 and other is -0
+fn wasm_max_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == 0.0 && b == 0.0 {
+        // Handle signed zero
+        if a.to_bits() == 0 || b.to_bits() == 0 {
+            0.0_f64
+        } else {
+            -0.0_f64
+        }
+    } else {
+        a.max(b)
+    }
+}
+
+// ============================================================================
 // Unary Operation Implementation
 // ============================================================================
 
@@ -558,6 +674,18 @@ fn execute_unary_op(op: UnaryOp, typ: NumberType, val: Value) -> Option<Value> {
         (UnaryOp::Neg, NumberType::F64, Value::F64(x)) => Value::F64(-x),
         (UnaryOp::Abs, NumberType::F32, Value::F32(x)) => Value::F32(x.abs()),
         (UnaryOp::Abs, NumberType::F64, Value::F64(x)) => Value::F64(x.abs()),
+
+        // Float math ops
+        (UnaryOp::Sqrt, NumberType::F32, Value::F32(x)) => Value::F32(x.sqrt()),
+        (UnaryOp::Sqrt, NumberType::F64, Value::F64(x)) => Value::F64(x.sqrt()),
+        (UnaryOp::Ceil, NumberType::F32, Value::F32(x)) => Value::F32(x.ceil()),
+        (UnaryOp::Ceil, NumberType::F64, Value::F64(x)) => Value::F64(x.ceil()),
+        (UnaryOp::Floor, NumberType::F32, Value::F32(x)) => Value::F32(x.floor()),
+        (UnaryOp::Floor, NumberType::F64, Value::F64(x)) => Value::F64(x.floor()),
+        (UnaryOp::Trunc, NumberType::F32, Value::F32(x)) => Value::F32(x.trunc()),
+        (UnaryOp::Trunc, NumberType::F64, Value::F64(x)) => Value::F64(x.trunc()),
+        (UnaryOp::Nearest, NumberType::F32, Value::F32(x)) => Value::F32(wasm_nearest_f32(x)),
+        (UnaryOp::Nearest, NumberType::F64, Value::F64(x)) => Value::F64(wasm_nearest_f64(x)),
 
         // Clz (count leading zeros)
         (UnaryOp::Clz, NumberType::I32, Value::I32(x)) => Value::I32(x.leading_zeros() as i32),
@@ -691,12 +819,18 @@ fn execute_binary_op(op: BinaryOp, typ: NumberType, v1: Value, v2: Value) -> Opt
         (BinaryOp::Sub, NumberType::F32, Value::F32(a), Value::F32(b)) => Value::F32(a - b),
         (BinaryOp::Mul, NumberType::F32, Value::F32(a), Value::F32(b)) => Value::F32(a * b),
         (BinaryOp::Div, NumberType::F32, Value::F32(a), Value::F32(b)) => Value::F32(a / b),
+        (BinaryOp::Min, NumberType::F32, Value::F32(a), Value::F32(b)) => Value::F32(wasm_min_f32(a, b)),
+        (BinaryOp::Max, NumberType::F32, Value::F32(a), Value::F32(b)) => Value::F32(wasm_max_f32(a, b)),
+        (BinaryOp::Copysign, NumberType::F32, Value::F32(a), Value::F32(b)) => Value::F32(a.copysign(b)),
 
         // F64 operations
         (BinaryOp::Add, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(a + b),
         (BinaryOp::Sub, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(a - b),
         (BinaryOp::Mul, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(a * b),
         (BinaryOp::Div, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(a / b),
+        (BinaryOp::Min, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(wasm_min_f64(a, b)),
+        (BinaryOp::Max, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(wasm_max_f64(a, b)),
+        (BinaryOp::Copysign, NumberType::F64, Value::F64(a), Value::F64(b)) => Value::F64(a.copysign(b)),
 
         _ => return None,
     })

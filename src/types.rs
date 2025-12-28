@@ -181,6 +181,12 @@ pub enum UnaryOp {
     Extend8S,
     Extend16S,
     Extend32S, // i64 only
+    // Float-specific unary ops
+    Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +207,10 @@ pub enum BinaryOp {
     ShrU,
     Rotl,
     Rotr,
+    // Float-specific binary ops
+    Min,
+    Max,
+    Copysign,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
