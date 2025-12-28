@@ -1,0 +1,8 @@
+[package]
+name = "wasm_interp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmparser = "0.219"
+wast = "219"
