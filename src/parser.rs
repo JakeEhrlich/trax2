@@ -1,5 +1,6 @@
 use crate::types::*;
 use std::collections::HashMap;
+use wasmparser::{Parser, Payload, ValType as WpValType, Operator};
 
 // ============================================================================
 // Parsing Error Type
@@ -11,11 +12,18 @@ pub enum ParseError {
     UnsupportedInstruction(String),
     UnsupportedFeature(String),
     InvalidModule(String),
+    BinaryParseError(String),
 }
 
 impl From<wast::Error> for ParseError {
     fn from(e: wast::Error) -> Self {
         ParseError::WastError(e.to_string())
+    }
+}
+
+impl From<wasmparser::BinaryReaderError> for ParseError {
+    fn from(e: wasmparser::BinaryReaderError) -> Self {
+        ParseError::BinaryParseError(e.to_string())
     }
 }
 
@@ -125,6 +133,432 @@ fn parse_quote_module(
     }
 }
 
+// ============================================================================
+// Binary Module Parsing (via wasmparser)
+// ============================================================================
+
+fn parse_binary_module(bytes: &[u8]) -> Result<(Module, HashMap<String, ExportItem>), ParseError> {
+    let mut types: Vec<RecType> = Vec::new();
+    let mut funcs: Vec<Function> = Vec::new();
+    let mut exports: HashMap<String, ExportItem> = HashMap::new();
+
+    // Track function type indices (from import + local functions)
+    let mut func_type_indices: Vec<u32> = Vec::new();
+    let mut num_imported_funcs: u32 = 0;
+
+    // Temporary storage for function bodies
+    let mut func_bodies: Vec<wasmparser::FunctionBody> = Vec::new();
+
+    let parser = Parser::new(0);
+    for payload in parser.parse_all(bytes) {
+        let payload = payload?;
+        match payload {
+            Payload::TypeSection(reader) => {
+                for rec_group in reader {
+                    let rec_group = rec_group?;
+                    for sub_type in rec_group.into_types() {
+                        if let wasmparser::CompositeInnerType::Func(func_type) = sub_type.composite_type.inner {
+                            let params: Vec<ValueType> = func_type.params()
+                                .iter()
+                                .map(|vt| convert_wp_val_type(*vt))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let results: Vec<ValueType> = func_type.results()
+                                .iter()
+                                .map(|vt| convert_wp_val_type(*vt))
+                                .collect::<Result<Vec<_>, _>>()?;
+
+                            types.push(RecType {
+                                subtypes: vec![SubType {
+                                    composite_type: CompositeType::Func(
+                                        ResultType { types: params },
+                                        ResultType { types: results },
+                                    ),
+                                }],
+                            });
+                        }
+                    }
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import?;
+                    if let wasmparser::TypeRef::Func(type_idx) = import.ty {
+                        func_type_indices.push(type_idx);
+                        num_imported_funcs += 1;
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for type_idx in reader {
+                    let type_idx = type_idx?;
+                    func_type_indices.push(type_idx);
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export?;
+                    match export.kind {
+                        wasmparser::ExternalKind::Func => {
+                            exports.insert(export.name.to_string(), ExportItem::Func(export.index));
+                        }
+                        wasmparser::ExternalKind::Memory => {
+                            exports.insert(export.name.to_string(), ExportItem::Memory(export.index));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                func_bodies.push(body);
+            }
+            _ => {}
+        }
+    }
+
+    // Now parse function bodies
+    for (i, body) in func_bodies.into_iter().enumerate() {
+        let func_idx = num_imported_funcs + i as u32;
+        let type_idx = func_type_indices.get(func_idx as usize)
+            .copied()
+            .ok_or_else(|| ParseError::InvalidModule("Function without type".to_string()))?;
+
+        // Get locals
+        let mut locals: Vec<ValueType> = Vec::new();
+        let locals_reader = body.get_locals_reader()?;
+        for local in locals_reader {
+            let (count, val_type) = local?;
+            let vt = convert_wp_val_type(val_type)?;
+            for _ in 0..count {
+                locals.push(vt.clone());
+            }
+        }
+
+        // Parse function body
+        let ops_reader = body.get_operators_reader()?;
+        let func = parse_binary_function(type_idx, locals, ops_reader)?;
+        funcs.push(func);
+    }
+
+    Ok((
+        Module {
+            types,
+            funcs,
+            mems: vec![],
+            start: None,
+        },
+        exports,
+    ))
+}
+
+fn convert_wp_val_type(vt: WpValType) -> Result<ValueType, ParseError> {
+    match vt {
+        WpValType::I32 => Ok(ValueType::Number(NumberType::I32)),
+        WpValType::I64 => Ok(ValueType::Number(NumberType::I64)),
+        WpValType::F32 => Ok(ValueType::Number(NumberType::F32)),
+        WpValType::F64 => Ok(ValueType::Number(NumberType::F64)),
+        _ => Err(ParseError::UnsupportedFeature(format!("Value type {:?}", vt))),
+    }
+}
+
+fn parse_binary_function(
+    type_idx: u32,
+    locals: Vec<ValueType>,
+    ops_reader: wasmparser::OperatorsReader,
+) -> Result<Function, ParseError> {
+    let mut builder = InstrBuilder::new();
+
+    // Create entry block
+    builder.emit(Instruction::Nop); // Placeholder for entry block
+    builder.block_stack.push((0, false, BlockType::None));
+
+    for op in ops_reader {
+        let op = op?;
+        parse_binary_operator(&mut builder, op)?;
+    }
+
+    // Finalize remaining blocks
+    finalize_blocks(&mut builder)?;
+
+    Ok(Function {
+        type_idx,
+        locals,
+        body: builder.body,
+    })
+}
+
+fn parse_binary_operator(builder: &mut InstrBuilder, op: Operator) -> Result<(), ParseError> {
+    use Operator as Op;
+
+    match op {
+        Op::Unreachable => { builder.emit(Instruction::Unreachable); },
+        Op::Nop => { builder.emit(Instruction::Nop); },
+
+        Op::Block { blockty } => {
+            let block_type = convert_wp_block_type(blockty)?;
+            let block_start = builder.current_idx();
+            builder.emit(Instruction::Nop); // Placeholder
+            builder.block_stack.push((block_start, false, block_type));
+        }
+        Op::Loop { blockty } => {
+            let block_type = convert_wp_block_type(blockty)?;
+            let block_start = builder.current_idx();
+            builder.emit(Instruction::Nop); // Placeholder
+            builder.block_stack.push((block_start, true, block_type));
+        }
+        Op::If { blockty } => {
+            let block_type = convert_wp_block_type(blockty)?;
+            let if_start = builder.current_idx();
+            builder.emit(Instruction::Nop); // Placeholder for If
+            builder.block_stack.push((if_start, false, block_type));
+            // We need to track that this is an if, not a block
+            // For now, treat it like a block - will need refinement
+        }
+        Op::Else => {
+            // Handle else block - for now just continue
+            // This needs more sophisticated handling
+        }
+        Op::End => {
+            if let Some((block_start, is_loop, block_type)) = builder.block_stack.pop() {
+                let block_end = builder.current_idx();
+
+                // Collect direct child instructions, skipping nested block contents
+                let instrs = builder.collect_instrs(block_start, block_end);
+
+                // Calculate next location - after this block in the parent
+                let next_loc = if let Some((parent_start, _, _)) = builder.block_stack.last() {
+                    // Count how many direct children come before this block in the parent
+                    let mut parent_instr_idx = 0u32;
+                    let mut idx = *parent_start + 1;
+                    while idx < block_start {
+                        if let Some(&(_, end)) = builder.consumed_ranges.iter().find(|&&(s, _)| s == idx) {
+                            idx = end;
+                        } else {
+                            parent_instr_idx += 1;
+                            idx += 1;
+                        }
+                    }
+                    FuncLoc {
+                        block_id: NodeIdx(*parent_start as u32),
+                        instr_idx: parent_instr_idx + 1,
+                    }
+                } else {
+                    FuncLoc {
+                        block_id: NodeIdx(0),
+                        instr_idx: 0,
+                    }
+                };
+
+                // Mark this block's range as consumed
+                builder.mark_consumed(block_start, block_end);
+
+                let block = BlockInst {
+                    block_type,
+                    instrs,
+                    is_loop,
+                    next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
+                };
+
+                builder.body[block_start] = Instruction::Block(Box::new(block));
+            }
+        }
+
+        Op::Br { relative_depth } => {
+            let target_idx = resolve_binary_branch_target(builder, relative_depth);
+            builder.emit(Instruction::Br(target_idx));
+        }
+        Op::BrIf { relative_depth } => {
+            let target_idx = resolve_binary_branch_target(builder, relative_depth);
+            builder.emit(Instruction::BrIf(target_idx));
+        }
+        Op::BrTable { targets } => {
+            let labels: Vec<NodeIdx> = targets.targets()
+                .map(|t| t.map(|d| resolve_binary_branch_target(builder, d)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let default = resolve_binary_branch_target(builder, targets.default());
+            builder.emit(Instruction::BrTable { labels, default });
+        }
+
+        Op::Return => { builder.emit(Instruction::Return); },
+        Op::Call { function_index } => { builder.emit(Instruction::Call(function_index)); },
+
+        Op::Drop => { builder.emit(Instruction::Drop); },
+        Op::Select => { builder.emit(Instruction::Select(None)); },
+
+        Op::LocalGet { local_index } => { builder.emit(Instruction::LocalGet(local_index)); },
+        Op::LocalSet { local_index } => { builder.emit(Instruction::LocalSet(local_index)); },
+        Op::LocalTee { local_index } => { builder.emit(Instruction::LocalTee(local_index)); },
+
+        // i32 operations
+        Op::I32Const { value } => { builder.emit(Instruction::Const(Value::I32(value))); },
+        Op::I32Add => { builder.emit(Instruction::Binary { op: BinaryOp::Add, typ: NumberType::I32 }); },
+        Op::I32Sub => { builder.emit(Instruction::Binary { op: BinaryOp::Sub, typ: NumberType::I32 }); },
+        Op::I32Mul => { builder.emit(Instruction::Binary { op: BinaryOp::Mul, typ: NumberType::I32 }); },
+        Op::I32DivS => { builder.emit(Instruction::Binary { op: BinaryOp::DivS, typ: NumberType::I32 }); },
+        Op::I32DivU => { builder.emit(Instruction::Binary { op: BinaryOp::DivU, typ: NumberType::I32 }); },
+        Op::I32RemS => { builder.emit(Instruction::Binary { op: BinaryOp::RemS, typ: NumberType::I32 }); },
+        Op::I32RemU => { builder.emit(Instruction::Binary { op: BinaryOp::RemU, typ: NumberType::I32 }); },
+        Op::I32And => { builder.emit(Instruction::Binary { op: BinaryOp::And, typ: NumberType::I32 }); },
+        Op::I32Or => { builder.emit(Instruction::Binary { op: BinaryOp::Or, typ: NumberType::I32 }); },
+        Op::I32Xor => { builder.emit(Instruction::Binary { op: BinaryOp::Xor, typ: NumberType::I32 }); },
+        Op::I32Shl => { builder.emit(Instruction::Binary { op: BinaryOp::Shl, typ: NumberType::I32 }); },
+        Op::I32ShrS => { builder.emit(Instruction::Binary { op: BinaryOp::ShrS, typ: NumberType::I32 }); },
+        Op::I32ShrU => { builder.emit(Instruction::Binary { op: BinaryOp::ShrU, typ: NumberType::I32 }); },
+        Op::I32Rotl => { builder.emit(Instruction::Binary { op: BinaryOp::Rotl, typ: NumberType::I32 }); },
+        Op::I32Rotr => { builder.emit(Instruction::Binary { op: BinaryOp::Rotr, typ: NumberType::I32 }); },
+        Op::I32Clz => { builder.emit(Instruction::Unary { op: UnaryOp::Clz, typ: NumberType::I32 }); },
+        Op::I32Ctz => { builder.emit(Instruction::Unary { op: UnaryOp::Ctz, typ: NumberType::I32 }); },
+        Op::I32Popcnt => { builder.emit(Instruction::Unary { op: UnaryOp::Popcnt, typ: NumberType::I32 }); },
+        Op::I32Eqz => { builder.emit(Instruction::Unary { op: UnaryOp::Eqz, typ: NumberType::I32 }); },
+        Op::I32Eq => { builder.emit(Instruction::Compare { op: CompareOp::Eq, typ: NumberType::I32 }); },
+        Op::I32Ne => { builder.emit(Instruction::Compare { op: CompareOp::Ne, typ: NumberType::I32 }); },
+        Op::I32LtS => { builder.emit(Instruction::Compare { op: CompareOp::LtS, typ: NumberType::I32 }); },
+        Op::I32LtU => { builder.emit(Instruction::Compare { op: CompareOp::LtU, typ: NumberType::I32 }); },
+        Op::I32GtS => { builder.emit(Instruction::Compare { op: CompareOp::GtS, typ: NumberType::I32 }); },
+        Op::I32GtU => { builder.emit(Instruction::Compare { op: CompareOp::GtU, typ: NumberType::I32 }); },
+        Op::I32LeS => { builder.emit(Instruction::Compare { op: CompareOp::LeS, typ: NumberType::I32 }); },
+        Op::I32LeU => { builder.emit(Instruction::Compare { op: CompareOp::LeU, typ: NumberType::I32 }); },
+        Op::I32GeS => { builder.emit(Instruction::Compare { op: CompareOp::GeS, typ: NumberType::I32 }); },
+        Op::I32GeU => { builder.emit(Instruction::Compare { op: CompareOp::GeU, typ: NumberType::I32 }); },
+        Op::I32Extend8S => { builder.emit(Instruction::Unary { op: UnaryOp::Extend8S, typ: NumberType::I32 }); },
+        Op::I32Extend16S => { builder.emit(Instruction::Unary { op: UnaryOp::Extend16S, typ: NumberType::I32 }); },
+
+        // i64 operations
+        Op::I64Const { value } => { builder.emit(Instruction::Const(Value::I64(value))); },
+        Op::I64Add => { builder.emit(Instruction::Binary { op: BinaryOp::Add, typ: NumberType::I64 }); },
+        Op::I64Sub => { builder.emit(Instruction::Binary { op: BinaryOp::Sub, typ: NumberType::I64 }); },
+        Op::I64Mul => { builder.emit(Instruction::Binary { op: BinaryOp::Mul, typ: NumberType::I64 }); },
+        Op::I64DivS => { builder.emit(Instruction::Binary { op: BinaryOp::DivS, typ: NumberType::I64 }); },
+        Op::I64DivU => { builder.emit(Instruction::Binary { op: BinaryOp::DivU, typ: NumberType::I64 }); },
+        Op::I64RemS => { builder.emit(Instruction::Binary { op: BinaryOp::RemS, typ: NumberType::I64 }); },
+        Op::I64RemU => { builder.emit(Instruction::Binary { op: BinaryOp::RemU, typ: NumberType::I64 }); },
+        Op::I64And => { builder.emit(Instruction::Binary { op: BinaryOp::And, typ: NumberType::I64 }); },
+        Op::I64Or => { builder.emit(Instruction::Binary { op: BinaryOp::Or, typ: NumberType::I64 }); },
+        Op::I64Xor => { builder.emit(Instruction::Binary { op: BinaryOp::Xor, typ: NumberType::I64 }); },
+        Op::I64Shl => { builder.emit(Instruction::Binary { op: BinaryOp::Shl, typ: NumberType::I64 }); },
+        Op::I64ShrS => { builder.emit(Instruction::Binary { op: BinaryOp::ShrS, typ: NumberType::I64 }); },
+        Op::I64ShrU => { builder.emit(Instruction::Binary { op: BinaryOp::ShrU, typ: NumberType::I64 }); },
+        Op::I64Rotl => { builder.emit(Instruction::Binary { op: BinaryOp::Rotl, typ: NumberType::I64 }); },
+        Op::I64Rotr => { builder.emit(Instruction::Binary { op: BinaryOp::Rotr, typ: NumberType::I64 }); },
+        Op::I64Clz => { builder.emit(Instruction::Unary { op: UnaryOp::Clz, typ: NumberType::I64 }); },
+        Op::I64Ctz => { builder.emit(Instruction::Unary { op: UnaryOp::Ctz, typ: NumberType::I64 }); },
+        Op::I64Popcnt => { builder.emit(Instruction::Unary { op: UnaryOp::Popcnt, typ: NumberType::I64 }); },
+        Op::I64Eqz => { builder.emit(Instruction::Unary { op: UnaryOp::Eqz, typ: NumberType::I64 }); },
+        Op::I64Eq => { builder.emit(Instruction::Compare { op: CompareOp::Eq, typ: NumberType::I64 }); },
+        Op::I64Ne => { builder.emit(Instruction::Compare { op: CompareOp::Ne, typ: NumberType::I64 }); },
+        Op::I64LtS => { builder.emit(Instruction::Compare { op: CompareOp::LtS, typ: NumberType::I64 }); },
+        Op::I64LtU => { builder.emit(Instruction::Compare { op: CompareOp::LtU, typ: NumberType::I64 }); },
+        Op::I64GtS => { builder.emit(Instruction::Compare { op: CompareOp::GtS, typ: NumberType::I64 }); },
+        Op::I64GtU => { builder.emit(Instruction::Compare { op: CompareOp::GtU, typ: NumberType::I64 }); },
+        Op::I64LeS => { builder.emit(Instruction::Compare { op: CompareOp::LeS, typ: NumberType::I64 }); },
+        Op::I64LeU => { builder.emit(Instruction::Compare { op: CompareOp::LeU, typ: NumberType::I64 }); },
+        Op::I64GeS => { builder.emit(Instruction::Compare { op: CompareOp::GeS, typ: NumberType::I64 }); },
+        Op::I64GeU => { builder.emit(Instruction::Compare { op: CompareOp::GeU, typ: NumberType::I64 }); },
+        Op::I64Extend8S => { builder.emit(Instruction::Unary { op: UnaryOp::Extend8S, typ: NumberType::I64 }); },
+        Op::I64Extend16S => { builder.emit(Instruction::Unary { op: UnaryOp::Extend16S, typ: NumberType::I64 }); },
+        Op::I64Extend32S => { builder.emit(Instruction::Unary { op: UnaryOp::Extend32S, typ: NumberType::I64 }); },
+
+        // f32 operations
+        Op::F32Const { value } => { builder.emit(Instruction::Const(Value::F32(f32::from_bits(value.bits())))); },
+        Op::F32Add => { builder.emit(Instruction::Binary { op: BinaryOp::Add, typ: NumberType::F32 }); },
+        Op::F32Sub => { builder.emit(Instruction::Binary { op: BinaryOp::Sub, typ: NumberType::F32 }); },
+        Op::F32Mul => { builder.emit(Instruction::Binary { op: BinaryOp::Mul, typ: NumberType::F32 }); },
+        Op::F32Div => { builder.emit(Instruction::Binary { op: BinaryOp::Div, typ: NumberType::F32 }); },
+        Op::F32Min => { builder.emit(Instruction::Binary { op: BinaryOp::Min, typ: NumberType::F32 }); },
+        Op::F32Max => { builder.emit(Instruction::Binary { op: BinaryOp::Max, typ: NumberType::F32 }); },
+        Op::F32Copysign => { builder.emit(Instruction::Binary { op: BinaryOp::Copysign, typ: NumberType::F32 }); },
+        Op::F32Abs => { builder.emit(Instruction::Unary { op: UnaryOp::Abs, typ: NumberType::F32 }); },
+        Op::F32Neg => { builder.emit(Instruction::Unary { op: UnaryOp::Neg, typ: NumberType::F32 }); },
+        Op::F32Sqrt => { builder.emit(Instruction::Unary { op: UnaryOp::Sqrt, typ: NumberType::F32 }); },
+        Op::F32Ceil => { builder.emit(Instruction::Unary { op: UnaryOp::Ceil, typ: NumberType::F32 }); },
+        Op::F32Floor => { builder.emit(Instruction::Unary { op: UnaryOp::Floor, typ: NumberType::F32 }); },
+        Op::F32Trunc => { builder.emit(Instruction::Unary { op: UnaryOp::Trunc, typ: NumberType::F32 }); },
+        Op::F32Nearest => { builder.emit(Instruction::Unary { op: UnaryOp::Nearest, typ: NumberType::F32 }); },
+        Op::F32Eq => { builder.emit(Instruction::Compare { op: CompareOp::Eq, typ: NumberType::F32 }); },
+        Op::F32Ne => { builder.emit(Instruction::Compare { op: CompareOp::Ne, typ: NumberType::F32 }); },
+        Op::F32Lt => { builder.emit(Instruction::Compare { op: CompareOp::Lt, typ: NumberType::F32 }); },
+        Op::F32Gt => { builder.emit(Instruction::Compare { op: CompareOp::Gt, typ: NumberType::F32 }); },
+        Op::F32Le => { builder.emit(Instruction::Compare { op: CompareOp::Le, typ: NumberType::F32 }); },
+        Op::F32Ge => { builder.emit(Instruction::Compare { op: CompareOp::Ge, typ: NumberType::F32 }); },
+
+        // f64 operations
+        Op::F64Const { value } => { builder.emit(Instruction::Const(Value::F64(f64::from_bits(value.bits())))); },
+        Op::F64Add => { builder.emit(Instruction::Binary { op: BinaryOp::Add, typ: NumberType::F64 }); },
+        Op::F64Sub => { builder.emit(Instruction::Binary { op: BinaryOp::Sub, typ: NumberType::F64 }); },
+        Op::F64Mul => { builder.emit(Instruction::Binary { op: BinaryOp::Mul, typ: NumberType::F64 }); },
+        Op::F64Div => { builder.emit(Instruction::Binary { op: BinaryOp::Div, typ: NumberType::F64 }); },
+        Op::F64Min => { builder.emit(Instruction::Binary { op: BinaryOp::Min, typ: NumberType::F64 }); },
+        Op::F64Max => { builder.emit(Instruction::Binary { op: BinaryOp::Max, typ: NumberType::F64 }); },
+        Op::F64Copysign => { builder.emit(Instruction::Binary { op: BinaryOp::Copysign, typ: NumberType::F64 }); },
+        Op::F64Abs => { builder.emit(Instruction::Unary { op: UnaryOp::Abs, typ: NumberType::F64 }); },
+        Op::F64Neg => { builder.emit(Instruction::Unary { op: UnaryOp::Neg, typ: NumberType::F64 }); },
+        Op::F64Sqrt => { builder.emit(Instruction::Unary { op: UnaryOp::Sqrt, typ: NumberType::F64 }); },
+        Op::F64Ceil => { builder.emit(Instruction::Unary { op: UnaryOp::Ceil, typ: NumberType::F64 }); },
+        Op::F64Floor => { builder.emit(Instruction::Unary { op: UnaryOp::Floor, typ: NumberType::F64 }); },
+        Op::F64Trunc => { builder.emit(Instruction::Unary { op: UnaryOp::Trunc, typ: NumberType::F64 }); },
+        Op::F64Nearest => { builder.emit(Instruction::Unary { op: UnaryOp::Nearest, typ: NumberType::F64 }); },
+        Op::F64Eq => { builder.emit(Instruction::Compare { op: CompareOp::Eq, typ: NumberType::F64 }); },
+        Op::F64Ne => { builder.emit(Instruction::Compare { op: CompareOp::Ne, typ: NumberType::F64 }); },
+        Op::F64Lt => { builder.emit(Instruction::Compare { op: CompareOp::Lt, typ: NumberType::F64 }); },
+        Op::F64Gt => { builder.emit(Instruction::Compare { op: CompareOp::Gt, typ: NumberType::F64 }); },
+        Op::F64Le => { builder.emit(Instruction::Compare { op: CompareOp::Le, typ: NumberType::F64 }); },
+        Op::F64Ge => { builder.emit(Instruction::Compare { op: CompareOp::Ge, typ: NumberType::F64 }); },
+
+        // Conversions
+        Op::I32WrapI64 => { builder.emit(Instruction::Convert { op: ConvertOp::Wrap, from: NumberType::I64, to: NumberType::I32 }); },
+        Op::I64ExtendI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ExtendS, from: NumberType::I32, to: NumberType::I64 }); },
+        Op::I64ExtendI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ExtendU, from: NumberType::I32, to: NumberType::I64 }); },
+        Op::I32TruncF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F32, to: NumberType::I32 }); },
+        Op::I32TruncF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F32, to: NumberType::I32 }); },
+        Op::I32TruncF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F64, to: NumberType::I32 }); },
+        Op::I32TruncF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F64, to: NumberType::I32 }); },
+        Op::I64TruncF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F32, to: NumberType::I64 }); },
+        Op::I64TruncF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F32, to: NumberType::I64 }); },
+        Op::I64TruncF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F64, to: NumberType::I64 }); },
+        Op::I64TruncF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F64, to: NumberType::I64 }); },
+        Op::F32ConvertI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I32, to: NumberType::F32 }); },
+        Op::F32ConvertI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I32, to: NumberType::F32 }); },
+        Op::F32ConvertI64S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I64, to: NumberType::F32 }); },
+        Op::F32ConvertI64U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I64, to: NumberType::F32 }); },
+        Op::F64ConvertI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I32, to: NumberType::F64 }); },
+        Op::F64ConvertI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I32, to: NumberType::F64 }); },
+        Op::F64ConvertI64S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I64, to: NumberType::F64 }); },
+        Op::F64ConvertI64U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I64, to: NumberType::F64 }); },
+        Op::F32DemoteF64 => { builder.emit(Instruction::Convert { op: ConvertOp::Demote, from: NumberType::F64, to: NumberType::F32 }); },
+        Op::F64PromoteF32 => { builder.emit(Instruction::Convert { op: ConvertOp::Promote, from: NumberType::F32, to: NumberType::F64 }); },
+        Op::I32ReinterpretF32 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::F32, to: NumberType::I32 }); },
+        Op::I64ReinterpretF64 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::F64, to: NumberType::I64 }); },
+        Op::F32ReinterpretI32 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::I32, to: NumberType::F32 }); },
+        Op::F64ReinterpretI64 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::I64, to: NumberType::F64 }); },
+
+        other => {
+            return Err(ParseError::UnsupportedInstruction(format!("{:?}", other)));
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_binary_branch_target(builder: &InstrBuilder, relative_depth: u32) -> NodeIdx {
+    if builder.block_stack.len() > relative_depth as usize {
+        let stack_idx = builder.block_stack.len() - 1 - relative_depth as usize;
+        NodeIdx(builder.block_stack[stack_idx].0 as u32)
+    } else {
+        NodeIdx(0) // Entry block
+    }
+}
+
+fn convert_wp_block_type(bt: wasmparser::BlockType) -> Result<BlockType, ParseError> {
+    match bt {
+        wasmparser::BlockType::Empty => Ok(BlockType::None),
+        wasmparser::BlockType::Type(vt) => {
+            Ok(BlockType::Value(convert_wp_val_type(vt)?))
+        }
+        wasmparser::BlockType::FuncType(idx) => {
+            Ok(BlockType::TypeIdx(idx))
+        }
+    }
+}
+
 fn parse_module(
     module: &mut wast::core::Module,
 ) -> Result<(Module, HashMap<String, ExportItem>), ParseError> {
@@ -135,8 +569,13 @@ fn parse_module(
 
     let fields = match &module.kind {
         wast::core::ModuleKind::Text(fields) => fields,
-        wast::core::ModuleKind::Binary(_) => {
-            return Err(ParseError::UnsupportedFeature("Binary module".to_string()));
+        wast::core::ModuleKind::Binary(bytes) => {
+            // Concatenate all byte slices and parse as binary
+            let mut all_bytes: Vec<u8> = Vec::new();
+            for slice in bytes.iter() {
+                all_bytes.extend_from_slice(slice);
+            }
+            return parse_binary_module(&all_bytes);
         }
     };
 
@@ -366,8 +805,11 @@ fn parse_function(
 
 struct InstrBuilder {
     body: Vec<Instruction>,
-    // Stack of (block_start_idx, is_loop) for handling control flow
+    // Stack of (block_start_idx, is_loop, block_type) for handling control flow
     block_stack: Vec<(usize, bool, BlockType)>,
+    // Ranges consumed by nested blocks at each nesting level
+    // When a block finishes, its range is added here so parent doesn't include its contents
+    consumed_ranges: Vec<(usize, usize)>,  // (start, end) - exclusive end
 }
 
 impl InstrBuilder {
@@ -375,6 +817,7 @@ impl InstrBuilder {
         InstrBuilder {
             body: Vec::new(),
             block_stack: Vec::new(),
+            consumed_ranges: Vec::new(),
         }
     }
 
@@ -386,6 +829,30 @@ impl InstrBuilder {
 
     fn current_idx(&self) -> usize {
         self.body.len()
+    }
+
+    /// Collect direct child instruction indices for a block, skipping consumed ranges
+    /// but including the consumed block itself (not its contents)
+    fn collect_instrs(&self, block_start: usize, block_end: usize) -> Vec<NodeIdx> {
+        let mut instrs = Vec::new();
+        let mut idx = block_start + 1;  // Skip the block instruction itself
+        while idx < block_end {
+            // Check if this index is the start of a consumed range (nested block)
+            if let Some(&(start, end)) = self.consumed_ranges.iter().find(|&&(s, _)| s == idx) {
+                // Include the nested block itself, but skip its contents
+                instrs.push(NodeIdx(start as u32));
+                idx = end;
+            } else {
+                instrs.push(NodeIdx(idx as u32));
+                idx += 1;
+            }
+        }
+        instrs
+    }
+
+    /// Mark a range as consumed by a nested block
+    fn mark_consumed(&mut self, start: usize, end: usize) {
+        self.consumed_ranges.push((start, end));
     }
 }
 
@@ -477,24 +944,45 @@ fn convert_single_instruction(
             if let Some((block_start, is_loop, block_type)) = builder.block_stack.pop() {
                 let block_end = builder.current_idx();
 
-                // Collect all instructions between block_start+1 and block_end
-                let mut instrs: Vec<NodeIdx> = Vec::new();
-                for idx in (block_start + 1)..block_end {
-                    instrs.push(NodeIdx(idx as u32));
-                }
+                // Collect direct child instructions, skipping nested block contents
+                let instrs = builder.collect_instrs(block_start, block_end);
 
                 // For inner blocks, next points to after this block in the parent
-                // The parent block's instruction list will include this block at some index
-                let next_loc = FuncLoc {
-                    block_id: NodeIdx(block_start as u32),
-                    instr_idx: instrs.len() as u32,
+                // We need to calculate the index considering consumed ranges
+                let next_loc = if let Some((parent_start, _, _)) = builder.block_stack.last() {
+                    // Count how many direct children come before this block in the parent
+                    let mut parent_instr_idx = 0u32;
+                    let mut idx = *parent_start + 1;
+                    while idx < block_start {
+                        // Check if this index is the start of a consumed range
+                        if let Some(&(_, end)) = builder.consumed_ranges.iter().find(|&&(s, _)| s == idx) {
+                            idx = end;
+                        } else {
+                            parent_instr_idx += 1;
+                            idx += 1;
+                        }
+                    }
+                    // After this block is at parent_instr_idx + 1
+                    FuncLoc {
+                        block_id: NodeIdx(*parent_start as u32),
+                        instr_idx: parent_instr_idx + 1,
+                    }
+                } else {
+                    // This is the entry block (no parent), should have next: None
+                    FuncLoc {
+                        block_id: NodeIdx(0),
+                        instr_idx: 0,
+                    }
                 };
+
+                // Mark this block's range as consumed
+                builder.mark_consumed(block_start, block_end);
 
                 let block = BlockInst {
                     block_type,
                     instrs,
                     is_loop,
-                    next: Some(next_loc),  // Inner blocks have a next location
+                    next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
                 };
 
                 // Replace the placeholder at block_start
@@ -733,10 +1221,8 @@ fn finalize_blocks(builder: &mut InstrBuilder) -> Result<(), ParseError> {
     while let Some((block_start, is_loop, block_type)) = builder.block_stack.pop() {
         let block_end = builder.current_idx();
 
-        let mut instrs: Vec<NodeIdx> = Vec::new();
-        for idx in (block_start + 1)..block_end {
-            instrs.push(NodeIdx(idx as u32));
-        }
+        // Collect direct child instructions, skipping nested block contents
+        let instrs = builder.collect_instrs(block_start, block_end);
 
         let block = BlockInst {
             block_type,
