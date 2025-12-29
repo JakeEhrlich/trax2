@@ -211,22 +211,28 @@ fn resolve_type_use(
         return Ok(resolve_index(idx));
     }
 
-    // Create inline type
-    let func_type = ty.inline.as_ref().ok_or_else(|| {
-        ParseError::InvalidModule("Function has no type".to_string())
-    })?;
+    // Get inline type, or create empty function type if none specified
+    let (params, results): (Vec<ValueType>, Vec<ValueType>) = match ty.inline.as_ref() {
+        Some(func_type) => {
+            let params: Vec<ValueType> = func_type
+                .params
+                .iter()
+                .map(|(_, _, vt)| convert_val_type(vt))
+                .collect::<Result<Vec<_>, _>>()?;
 
-    let params: Vec<ValueType> = func_type
-        .params
-        .iter()
-        .map(|(_, _, vt)| convert_val_type(vt))
-        .collect::<Result<Vec<_>, _>>()?;
+            let results: Vec<ValueType> = func_type
+                .results
+                .iter()
+                .map(convert_val_type)
+                .collect::<Result<Vec<_>, _>>()?;
 
-    let results: Vec<ValueType> = func_type
-        .results
-        .iter()
-        .map(convert_val_type)
-        .collect::<Result<Vec<_>, _>>()?;
+            (params, results)
+        }
+        None => {
+            // No type specified - create void -> void function type
+            (vec![], vec![])
+        }
+    };
 
     let rec_type = RecType {
         subtypes: vec![SubType {
@@ -519,6 +525,28 @@ fn convert_single_instruction(
             builder.emit(Instruction::BrIf(target_idx));
         }
 
+        WI::BrTable(bt) => {
+            let labels: Vec<NodeIdx> = bt.labels.iter().map(|idx| {
+                let depth = resolve_index(idx);
+                if builder.block_stack.len() > depth as usize {
+                    let stack_idx = builder.block_stack.len() - 1 - depth as usize;
+                    NodeIdx(builder.block_stack[stack_idx].0 as u32)
+                } else {
+                    NodeIdx(0)
+                }
+            }).collect();
+
+            let default_depth = resolve_index(&bt.default);
+            let default = if builder.block_stack.len() > default_depth as usize {
+                let stack_idx = builder.block_stack.len() - 1 - default_depth as usize;
+                NodeIdx(builder.block_stack[stack_idx].0 as u32)
+            } else {
+                NodeIdx(0)
+            };
+
+            builder.emit(Instruction::BrTable { labels, default });
+        }
+
         WI::Call(idx) => { builder.emit(Instruction::Call(resolve_index(idx))); }
 
         // Locals
@@ -603,6 +631,36 @@ fn convert_single_instruction(
         WI::I32WrapI64 => { builder.emit(Instruction::Convert { op: ConvertOp::Wrap, from: NumberType::I64, to: NumberType::I32 }); }
         WI::I64ExtendI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ExtendS, from: NumberType::I32, to: NumberType::I64 }); }
         WI::I64ExtendI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ExtendU, from: NumberType::I32, to: NumberType::I64 }); }
+
+        // Truncation: float -> int
+        WI::I32TruncF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F32, to: NumberType::I32 }); }
+        WI::I32TruncF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F32, to: NumberType::I32 }); }
+        WI::I32TruncF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F64, to: NumberType::I32 }); }
+        WI::I32TruncF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F64, to: NumberType::I32 }); }
+        WI::I64TruncF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F32, to: NumberType::I64 }); }
+        WI::I64TruncF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F32, to: NumberType::I64 }); }
+        WI::I64TruncF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F64, to: NumberType::I64 }); }
+        WI::I64TruncF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F64, to: NumberType::I64 }); }
+
+        // Conversion: int -> float
+        WI::F32ConvertI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I32, to: NumberType::F32 }); }
+        WI::F32ConvertI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I32, to: NumberType::F32 }); }
+        WI::F32ConvertI64S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I64, to: NumberType::F32 }); }
+        WI::F32ConvertI64U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I64, to: NumberType::F32 }); }
+        WI::F64ConvertI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I32, to: NumberType::F64 }); }
+        WI::F64ConvertI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I32, to: NumberType::F64 }); }
+        WI::F64ConvertI64S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I64, to: NumberType::F64 }); }
+        WI::F64ConvertI64U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I64, to: NumberType::F64 }); }
+
+        // Demote/Promote: float -> float
+        WI::F32DemoteF64 => { builder.emit(Instruction::Convert { op: ConvertOp::Demote, from: NumberType::F64, to: NumberType::F32 }); }
+        WI::F64PromoteF32 => { builder.emit(Instruction::Convert { op: ConvertOp::Promote, from: NumberType::F32, to: NumberType::F64 }); }
+
+        // Reinterpret: same bits, different type
+        WI::I32ReinterpretF32 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::F32, to: NumberType::I32 }); }
+        WI::I64ReinterpretF64 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::F64, to: NumberType::I64 }); }
+        WI::F32ReinterpretI32 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::I32, to: NumberType::F32 }); }
+        WI::F64ReinterpretI64 => { builder.emit(Instruction::Convert { op: ConvertOp::Reinterpret, from: NumberType::I64, to: NumberType::F64 }); }
 
         // f32 operations
         WI::F32Const(v) => { builder.emit(Instruction::Const(Value::F32(f32::from_bits(v.bits)))); }

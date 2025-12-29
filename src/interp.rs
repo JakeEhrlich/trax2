@@ -320,6 +320,30 @@ impl Interpreter for ModuleInterpreter {
                 // Branch not taken, fall through to next instruction
             }
 
+            Instruction::BrTable { labels, default } => {
+                let idx = cont.frame.stack.pop()?;
+                let idx_val = match idx {
+                    Value::I32(v) => v as usize,
+                    _ => return None,
+                };
+
+                let target = if idx_val < labels.len() {
+                    labels[idx_val]
+                } else {
+                    *default
+                };
+
+                match self.branch_to_block(func, loc.func_id, target)? {
+                    AdvanceResult::Continue(new_loc) => {
+                        cont.frame.loc = new_loc;
+                        return Some(StepResult::Cont(cont));
+                    }
+                    AdvanceResult::ImplicitReturn => {
+                        return self.do_return(state, cont, func);
+                    }
+                }
+            }
+
             Instruction::Call(callee_func_id) => {
                 let callee_func = self.get_func(*callee_func_id)?;
                 let (param_types, _result_types) = self.get_func_type(callee_func)?;
@@ -938,20 +962,34 @@ fn execute_convert_op(op: ConvertOp, from: NumberType, to: NumberType, val: Valu
             Value::I64(x.trunc() as u64 as i64)
         }
 
-        // i32 -> f32/f64 convert
-        (ConvertOp::Convert, NumberType::I32, NumberType::F32, Value::I32(x)) => {
+        // i32 -> f32/f64 convert (signed)
+        (ConvertOp::ConvertS, NumberType::I32, NumberType::F32, Value::I32(x)) => {
             Value::F32(x as f32)
         }
-        (ConvertOp::Convert, NumberType::I32, NumberType::F64, Value::I32(x)) => {
+        (ConvertOp::ConvertS, NumberType::I32, NumberType::F64, Value::I32(x)) => {
             Value::F64(x as f64)
+        }
+        // i32 -> f32/f64 convert (unsigned)
+        (ConvertOp::ConvertU, NumberType::I32, NumberType::F32, Value::I32(x)) => {
+            Value::F32((x as u32) as f32)
+        }
+        (ConvertOp::ConvertU, NumberType::I32, NumberType::F64, Value::I32(x)) => {
+            Value::F64((x as u32) as f64)
         }
 
-        // i64 -> f32/f64 convert
-        (ConvertOp::Convert, NumberType::I64, NumberType::F32, Value::I64(x)) => {
+        // i64 -> f32/f64 convert (signed)
+        (ConvertOp::ConvertS, NumberType::I64, NumberType::F32, Value::I64(x)) => {
             Value::F32(x as f32)
         }
-        (ConvertOp::Convert, NumberType::I64, NumberType::F64, Value::I64(x)) => {
+        (ConvertOp::ConvertS, NumberType::I64, NumberType::F64, Value::I64(x)) => {
             Value::F64(x as f64)
+        }
+        // i64 -> f32/f64 convert (unsigned)
+        (ConvertOp::ConvertU, NumberType::I64, NumberType::F32, Value::I64(x)) => {
+            Value::F32((x as u64) as f32)
+        }
+        (ConvertOp::ConvertU, NumberType::I64, NumberType::F64, Value::I64(x)) => {
+            Value::F64((x as u64) as f64)
         }
 
         // f64 -> f32 demote
