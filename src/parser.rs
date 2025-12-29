@@ -587,9 +587,14 @@ fn parse_module(
         }
     };
 
-    // First pass: collect types
+    // First pass: collect types and build name-to-index map
+    let mut type_names: HashMap<String, u32> = HashMap::new();
     for field in fields.iter() {
         if let wast::core::ModuleField::Type(t) = field {
+            let type_idx = types.len() as u32;
+            if let Some(id) = &t.id {
+                type_names.insert(id.name().to_string(), type_idx);
+            }
             let rec_type = parse_type_def(t)?;
             types.push(rec_type);
         }
@@ -600,7 +605,7 @@ fn parse_module(
     for field in fields.iter() {
         match field {
             wast::core::ModuleField::Func(f) => {
-                let type_idx = resolve_type_use(&f.ty, &mut types)?;
+                let type_idx = resolve_type_use(&f.ty, &mut types, &type_names)?;
                 let func = parse_function(f, type_idx, &types)?;
                 funcs.push(func);
 
@@ -650,12 +655,22 @@ fn resolve_index(idx: &wast::token::Index) -> u32 {
     }
 }
 
+fn resolve_index_with_names(idx: &wast::token::Index, names: &HashMap<String, u32>) -> u32 {
+    match idx {
+        wast::token::Index::Num(n, _) => *n,
+        wast::token::Index::Id(id) => {
+            names.get(id.name()).copied().unwrap_or(0)
+        }
+    }
+}
+
 fn resolve_type_use(
     ty: &wast::core::TypeUse<'_, wast::core::FunctionType<'_>>,
     types: &mut Vec<RecType>,
+    type_names: &HashMap<String, u32>,
 ) -> Result<u32, ParseError> {
     if let Some(idx) = &ty.index {
-        return Ok(resolve_index(idx));
+        return Ok(resolve_index_with_names(idx, type_names));
     }
 
     // Get inline type, or create empty function type if none specified
@@ -772,14 +787,25 @@ fn parse_function(
 
     match &f.kind {
         wast::core::FuncKind::Inline { locals: func_locals, expression } => {
-            // First, get parameter names from the inline type if available
+            // Get the number of parameters from the type definition
             let mut local_idx = 0u32;
+
+            // First try inline type for param names
             if let Some(func_type) = &f.ty.inline {
                 for (id, _, _vt) in &func_type.params {
                     if let Some(name) = id {
                         local_names.insert(name.name().to_string(), local_idx);
                     }
                     local_idx += 1;
+                }
+            } else {
+                // No inline type - get param count from the type definition
+                if let Some(rec_type) = types.get(type_idx as usize) {
+                    if let Some(sub_type) = rec_type.subtypes.first() {
+                        if let CompositeType::Func(params, _) = &sub_type.composite_type {
+                            local_idx = params.types.len() as u32;
+                        }
+                    }
                 }
             }
 
