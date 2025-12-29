@@ -930,36 +930,36 @@ fn execute_convert_op(op: ConvertOp, from: NumberType, to: NumberType, val: Valu
             Value::I64((x as u32) as i64)
         }
 
-        // f32 -> i32 truncate
+        // f32 -> i32 truncate (traps on overflow/NaN)
         (ConvertOp::TruncS, NumberType::F32, NumberType::I32, Value::F32(x)) => {
-            Value::I32(x.trunc() as i32)
+            trunc_f32_to_i32_s(x)?
         }
         (ConvertOp::TruncU, NumberType::F32, NumberType::I32, Value::F32(x)) => {
-            Value::I32(x.trunc() as u32 as i32)
+            trunc_f32_to_u32(x)?
         }
 
-        // f64 -> i32 truncate
+        // f64 -> i32 truncate (traps on overflow/NaN)
         (ConvertOp::TruncS, NumberType::F64, NumberType::I32, Value::F64(x)) => {
-            Value::I32(x.trunc() as i32)
+            trunc_f64_to_i32_s(x)?
         }
         (ConvertOp::TruncU, NumberType::F64, NumberType::I32, Value::F64(x)) => {
-            Value::I32(x.trunc() as u32 as i32)
+            trunc_f64_to_u32(x)?
         }
 
-        // f32 -> i64 truncate
+        // f32 -> i64 truncate (traps on overflow/NaN)
         (ConvertOp::TruncS, NumberType::F32, NumberType::I64, Value::F32(x)) => {
-            Value::I64(x.trunc() as i64)
+            trunc_f32_to_i64_s(x)?
         }
         (ConvertOp::TruncU, NumberType::F32, NumberType::I64, Value::F32(x)) => {
-            Value::I64(x.trunc() as u64 as i64)
+            trunc_f32_to_u64(x)?
         }
 
-        // f64 -> i64 truncate
+        // f64 -> i64 truncate (traps on overflow/NaN)
         (ConvertOp::TruncS, NumberType::F64, NumberType::I64, Value::F64(x)) => {
-            Value::I64(x.trunc() as i64)
+            trunc_f64_to_i64_s(x)?
         }
         (ConvertOp::TruncU, NumberType::F64, NumberType::I64, Value::F64(x)) => {
-            Value::I64(x.trunc() as u64 as i64)
+            trunc_f64_to_u64(x)?
         }
 
         // i32 -> f32/f64 convert (signed)
@@ -1016,6 +1016,152 @@ fn execute_convert_op(op: ConvertOp, from: NumberType, to: NumberType, val: Valu
             Value::I64(x.to_bits() as i64)
         }
 
+        // Saturating truncations: f32/f64 -> i32/i64 (clamp on overflow, 0 on NaN)
+        (ConvertOp::TruncSatS, NumberType::F32, NumberType::I32, Value::F32(x)) => {
+            Value::I32(trunc_sat_f32_to_i32_s(x))
+        }
+        (ConvertOp::TruncSatU, NumberType::F32, NumberType::I32, Value::F32(x)) => {
+            Value::I32(trunc_sat_f32_to_u32(x) as i32)
+        }
+        (ConvertOp::TruncSatS, NumberType::F64, NumberType::I32, Value::F64(x)) => {
+            Value::I32(trunc_sat_f64_to_i32_s(x))
+        }
+        (ConvertOp::TruncSatU, NumberType::F64, NumberType::I32, Value::F64(x)) => {
+            Value::I32(trunc_sat_f64_to_u32(x) as i32)
+        }
+        (ConvertOp::TruncSatS, NumberType::F32, NumberType::I64, Value::F32(x)) => {
+            Value::I64(trunc_sat_f32_to_i64_s(x))
+        }
+        (ConvertOp::TruncSatU, NumberType::F32, NumberType::I64, Value::F32(x)) => {
+            Value::I64(trunc_sat_f32_to_u64(x) as i64)
+        }
+        (ConvertOp::TruncSatS, NumberType::F64, NumberType::I64, Value::F64(x)) => {
+            Value::I64(trunc_sat_f64_to_i64_s(x))
+        }
+        (ConvertOp::TruncSatU, NumberType::F64, NumberType::I64, Value::F64(x)) => {
+            Value::I64(trunc_sat_f64_to_u64(x) as i64)
+        }
+
         _ => return None,
     })
+}
+
+// Saturating truncation helpers
+fn trunc_sat_f32_to_i32_s(x: f32) -> i32 {
+    if x.is_nan() { return 0; }
+    if x >= i32::MAX as f32 { return i32::MAX; }
+    if x <= i32::MIN as f32 { return i32::MIN; }
+    x.trunc() as i32
+}
+
+fn trunc_sat_f32_to_u32(x: f32) -> u32 {
+    if x.is_nan() { return 0; }
+    if x >= u32::MAX as f32 { return u32::MAX; }
+    if x <= 0.0 { return 0; }
+    x.trunc() as u32
+}
+
+fn trunc_sat_f64_to_i32_s(x: f64) -> i32 {
+    if x.is_nan() { return 0; }
+    if x >= i32::MAX as f64 { return i32::MAX; }
+    if x <= i32::MIN as f64 { return i32::MIN; }
+    x.trunc() as i32
+}
+
+fn trunc_sat_f64_to_u32(x: f64) -> u32 {
+    if x.is_nan() { return 0; }
+    if x >= u32::MAX as f64 { return u32::MAX; }
+    if x <= 0.0 { return 0; }
+    x.trunc() as u32
+}
+
+fn trunc_sat_f32_to_i64_s(x: f32) -> i64 {
+    if x.is_nan() { return 0; }
+    if x >= i64::MAX as f32 { return i64::MAX; }
+    if x <= i64::MIN as f32 { return i64::MIN; }
+    x.trunc() as i64
+}
+
+fn trunc_sat_f32_to_u64(x: f32) -> u64 {
+    if x.is_nan() { return 0; }
+    if x >= u64::MAX as f32 { return u64::MAX; }
+    if x <= 0.0 { return 0; }
+    x.trunc() as u64
+}
+
+fn trunc_sat_f64_to_i64_s(x: f64) -> i64 {
+    if x.is_nan() { return 0; }
+    if x >= i64::MAX as f64 { return i64::MAX; }
+    if x <= i64::MIN as f64 { return i64::MIN; }
+    x.trunc() as i64
+}
+
+fn trunc_sat_f64_to_u64(x: f64) -> u64 {
+    if x.is_nan() { return 0; }
+    if x >= u64::MAX as f64 { return u64::MAX; }
+    if x <= 0.0 { return 0; }
+    x.trunc() as u64
+}
+
+// Trapping truncation helpers (return None to trap)
+// Use f64 for i32/u32 comparisons since f64 can represent all i32/u32 values exactly
+
+fn trunc_f32_to_i32_s(x: f32) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = (x as f64).trunc();  // Use f64 for exact comparison
+    if t < i32::MIN as f64 || t > i32::MAX as f64 { return None; }
+    Some(Value::I32(t as i32))
+}
+
+fn trunc_f32_to_u32(x: f32) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = (x as f64).trunc();
+    if t < 0.0 || t > u32::MAX as f64 { return None; }
+    Some(Value::I32(t as u32 as i32))
+}
+
+fn trunc_f64_to_i32_s(x: f64) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = x.trunc();
+    if t < i32::MIN as f64 || t > i32::MAX as f64 { return None; }
+    Some(Value::I32(t as i32))
+}
+
+fn trunc_f64_to_u32(x: f64) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = x.trunc();
+    if t < 0.0 || t > u32::MAX as f64 { return None; }
+    Some(Value::I32(t as u32 as i32))
+}
+
+fn trunc_f32_to_i64_s(x: f32) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = (x as f64).trunc();
+    // i64::MAX as f64 rounds, so check against the actual limit
+    if t < i64::MIN as f64 || t >= 9223372036854775808.0 { return None; }
+    Some(Value::I64(t as i64))
+}
+
+fn trunc_f32_to_u64(x: f32) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = (x as f64).trunc();
+    if t < 0.0 || t >= 18446744073709551616.0 { return None; }
+    Some(Value::I64(t as u64 as i64))
+}
+
+fn trunc_f64_to_i64_s(x: f64) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = x.trunc();
+    // i64::MAX (9223372036854775807) can't be represented exactly in f64
+    // f64 rounds it to 9223372036854775808.0, so use >= for upper bound
+    if t < i64::MIN as f64 || t >= 9223372036854775808.0 { return None; }
+    Some(Value::I64(t as i64))
+}
+
+fn trunc_f64_to_u64(x: f64) -> Option<Value> {
+    if x.is_nan() { return None; }
+    let t = x.trunc();
+    // u64::MAX rounds to 18446744073709551616.0 in f64
+    if t < 0.0 || t >= 18446744073709551616.0 { return None; }
+    Some(Value::I64(t as u64 as i64))
 }

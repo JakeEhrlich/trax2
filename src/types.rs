@@ -238,6 +238,8 @@ pub enum ConvertOp {
     ExtendU,
     TruncS,
     TruncU,
+    TruncSatS,
+    TruncSatU,
     ConvertS,
     ConvertU,
     Demote,

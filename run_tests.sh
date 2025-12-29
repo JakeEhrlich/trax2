@@ -71,6 +71,12 @@ run_test "testsuite/int_exprs.wast"
 # Local variable tests
 run_test "testsuite/local_set.wast"
 
+# Type definitions
+run_test "testsuite/type.wast"
+
+# Conversions
+run_test "testsuite/conversions.wast"
+
 echo ""
 echo "================"
 echo "TOTAL: $TOTAL_PASSED passed, $TOTAL_FAILED failed, $TOTAL_SKIPPED skipped"

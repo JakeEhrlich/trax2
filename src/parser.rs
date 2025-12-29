@@ -515,6 +515,14 @@ fn parse_binary_operator(builder: &mut InstrBuilder, op: Operator) -> Result<(),
         Op::I64TruncF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F32, to: NumberType::I64 }); },
         Op::I64TruncF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F64, to: NumberType::I64 }); },
         Op::I64TruncF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F64, to: NumberType::I64 }); },
+        Op::I32TruncSatF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F32, to: NumberType::I32 }); },
+        Op::I32TruncSatF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F32, to: NumberType::I32 }); },
+        Op::I32TruncSatF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F64, to: NumberType::I32 }); },
+        Op::I32TruncSatF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F64, to: NumberType::I32 }); },
+        Op::I64TruncSatF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F32, to: NumberType::I64 }); },
+        Op::I64TruncSatF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F32, to: NumberType::I64 }); },
+        Op::I64TruncSatF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F64, to: NumberType::I64 }); },
+        Op::I64TruncSatF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F64, to: NumberType::I64 }); },
         Op::F32ConvertI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I32, to: NumberType::F32 }); },
         Op::F32ConvertI32U => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertU, from: NumberType::I32, to: NumberType::F32 }); },
         Op::F32ConvertI64S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I64, to: NumberType::F32 }); },
@@ -1129,6 +1137,16 @@ fn convert_single_instruction(
         WI::I64TruncF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F32, to: NumberType::I64 }); }
         WI::I64TruncF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncS, from: NumberType::F64, to: NumberType::I64 }); }
         WI::I64TruncF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncU, from: NumberType::F64, to: NumberType::I64 }); }
+
+        // Saturating truncation: float -> int (no trap on overflow)
+        WI::I32TruncSatF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F32, to: NumberType::I32 }); }
+        WI::I32TruncSatF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F32, to: NumberType::I32 }); }
+        WI::I32TruncSatF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F64, to: NumberType::I32 }); }
+        WI::I32TruncSatF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F64, to: NumberType::I32 }); }
+        WI::I64TruncSatF32S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F32, to: NumberType::I64 }); }
+        WI::I64TruncSatF32U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F32, to: NumberType::I64 }); }
+        WI::I64TruncSatF64S => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatS, from: NumberType::F64, to: NumberType::I64 }); }
+        WI::I64TruncSatF64U => { builder.emit(Instruction::Convert { op: ConvertOp::TruncSatU, from: NumberType::F64, to: NumberType::I64 }); }
 
         // Conversion: int -> float
         WI::F32ConvertI32S => { builder.emit(Instruction::Convert { op: ConvertOp::ConvertS, from: NumberType::I32, to: NumberType::F32 }); }
