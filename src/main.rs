@@ -197,6 +197,7 @@ fn value_matches(actual: &Value, expected: &Value) -> bool {
                 a.to_bits() == e.to_bits()
             }
         }
+        (Value::Ref(a), Value::Ref(e)) => a == e,
         _ => false,
     }
 }

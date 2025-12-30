@@ -69,7 +69,9 @@ run_test "testsuite/float_misc.wast"
 run_test "testsuite/int_exprs.wast"
 
 # Local variable tests
+run_test "testsuite/local_get.wast"
 run_test "testsuite/local_set.wast"
+run_test "testsuite/local_init.wast"
 
 # Type definitions
 run_test "testsuite/type.wast"

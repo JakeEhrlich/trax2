@@ -656,7 +656,13 @@ impl TypedLocals {
         let Some((offset, ref expected_type)) = self.layout.get(idx as usize) else {
             return false;
         };
-        if value.value_type() != *expected_type {
+        // For reference types, allow any ref value to be assigned to any ref type
+        // (simplification - proper subtyping would be more complex)
+        let types_match = match (&value.value_type(), expected_type) {
+            (ValueType::Ref(_), ValueType::Ref(_)) => true,
+            (a, b) => a == b,
+        };
+        if !types_match {
             return false;
         }
         self.view.set_value(*offset, &value)

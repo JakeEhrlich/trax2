@@ -269,7 +269,7 @@ fn parse_binary_function(
 
     // Create entry block
     builder.emit(Instruction::Nop); // Placeholder for entry block
-    builder.block_stack.push((0, false, BlockType::None));
+    builder.block_stack.push((0, BlockKind::Block, BlockType::None));
 
     for op in ops_reader {
         let op = op?;
@@ -297,36 +297,33 @@ fn parse_binary_operator(builder: &mut InstrBuilder, op: Operator) -> Result<(),
             let block_type = convert_wp_block_type(blockty)?;
             let block_start = builder.current_idx();
             builder.emit(Instruction::Nop); // Placeholder
-            builder.block_stack.push((block_start, false, block_type));
+            builder.block_stack.push((block_start, BlockKind::Block, block_type));
         }
         Op::Loop { blockty } => {
             let block_type = convert_wp_block_type(blockty)?;
             let block_start = builder.current_idx();
             builder.emit(Instruction::Nop); // Placeholder
-            builder.block_stack.push((block_start, true, block_type));
+            builder.block_stack.push((block_start, BlockKind::Loop, block_type));
         }
         Op::If { blockty } => {
             let block_type = convert_wp_block_type(blockty)?;
             let if_start = builder.current_idx();
             builder.emit(Instruction::Nop); // Placeholder for If
-            builder.block_stack.push((if_start, false, block_type));
-            // We need to track that this is an if, not a block
-            // For now, treat it like a block - will need refinement
+            builder.block_stack.push((if_start, BlockKind::If { else_idx: None }, block_type));
         }
         Op::Else => {
-            // Handle else block - for now just continue
-            // This needs more sophisticated handling
+            // Mark the else position in the current if block
+            let idx = builder.current_idx();
+            if let Some((_, BlockKind::If { else_idx }, _)) = builder.block_stack.last_mut() {
+                *else_idx = Some(idx);
+            }
         }
         Op::End => {
-            if let Some((block_start, is_loop, block_type)) = builder.block_stack.pop() {
+            if let Some((block_start, kind, block_type)) = builder.block_stack.pop() {
                 let block_end = builder.current_idx();
-
-                // Collect direct child instructions, skipping nested block contents
-                let instrs = builder.collect_instrs(block_start, block_end);
 
                 // Calculate next location - after this block in the parent
                 let next_loc = if let Some((parent_start, _, _)) = builder.block_stack.last() {
-                    // Count how many direct children come before this block in the parent
                     let mut parent_instr_idx = 0u32;
                     let mut idx = *parent_start + 1;
                     while idx < block_start {
@@ -342,23 +339,63 @@ fn parse_binary_operator(builder: &mut InstrBuilder, op: Operator) -> Result<(),
                         instr_idx: parent_instr_idx + 1,
                     }
                 } else {
-                    FuncLoc {
-                        block_id: NodeIdx(0),
-                        instr_idx: 0,
-                    }
+                    FuncLoc { block_id: NodeIdx(0), instr_idx: 0 }
                 };
 
-                // Mark this block's range as consumed
                 builder.mark_consumed(block_start, block_end);
 
-                let block = BlockInst {
-                    block_type,
-                    instrs,
-                    is_loop,
-                    next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
-                };
+                match kind {
+                    BlockKind::If { else_idx } => {
+                        let else_start = else_idx.unwrap_or(block_end);
+                        let then_instrs = builder.collect_instrs(block_start, else_start);
+                        // For else, don't skip the first instruction (no block header to skip)
+                        let else_instrs: Vec<NodeIdx> = (else_start..block_end)
+                            .filter(|i| !builder.consumed_ranges.iter().any(|(s, e)| *i >= *s && *i < *e))
+                            .map(|i| NodeIdx(i as u32))
+                            .collect();
 
-                builder.body[block_start] = Instruction::Block(Box::new(block));
+                        let then_block_idx = builder.body.len();
+                        let then_block = BlockInst {
+                            block_type: block_type.clone(),
+                            instrs: then_instrs,
+                            is_loop: false,
+                            next: if builder.block_stack.is_empty() { None } else { Some(next_loc.clone()) },
+                        };
+                        builder.body.push(Instruction::Block(Box::new(then_block)));
+
+                        let else_block_idx = builder.body.len();
+                        let else_block = BlockInst {
+                            block_type: block_type.clone(),
+                            instrs: else_instrs,
+                            is_loop: false,
+                            next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
+                        };
+                        builder.body.push(Instruction::Block(Box::new(else_block)));
+
+                        // Exclude helper blocks from all parent instruction lists
+                        builder.exclude_index(then_block_idx);
+                        builder.exclude_index(else_block_idx);
+
+                        let if_inst = IfInst {
+                            block_type,
+                            then_block: NodeIdx(then_block_idx as u32),
+                            else_block: NodeIdx(else_block_idx as u32),
+                            next: FuncLoc { block_id: NodeIdx(0), instr_idx: 0 },
+                        };
+                        builder.body[block_start] = Instruction::If(Box::new(if_inst));
+                    }
+                    BlockKind::Block | BlockKind::Loop => {
+                        let instrs = builder.collect_instrs(block_start, block_end);
+                        let is_loop = matches!(kind, BlockKind::Loop);
+                        let block = BlockInst {
+                            block_type,
+                            instrs,
+                            is_loop,
+                            next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
+                        };
+                        builder.body[block_start] = Instruction::Block(Box::new(block));
+                    }
+                }
             }
         }
 
@@ -837,13 +874,21 @@ fn parse_function(
 // Instruction conversion - from flat wast format to our structured format
 // ============================================================================
 
+enum BlockKind {
+    Block,
+    Loop,
+    If { else_idx: Option<usize> },
+}
+
 struct InstrBuilder {
     body: Vec<Instruction>,
-    // Stack of (block_start_idx, is_loop, block_type) for handling control flow
-    block_stack: Vec<(usize, bool, BlockType)>,
+    // Stack of (block_start_idx, kind, block_type) for handling control flow
+    block_stack: Vec<(usize, BlockKind, BlockType)>,
     // Ranges consumed by nested blocks at each nesting level
     // When a block finishes, its range is added here so parent doesn't include its contents
     consumed_ranges: Vec<(usize, usize)>,  // (start, end) - exclusive end
+    // Indices that should be completely excluded from all instruction lists (helper blocks)
+    excluded_indices: std::collections::HashSet<usize>,
 }
 
 impl InstrBuilder {
@@ -852,6 +897,7 @@ impl InstrBuilder {
             body: Vec::new(),
             block_stack: Vec::new(),
             consumed_ranges: Vec::new(),
+            excluded_indices: std::collections::HashSet::new(),
         }
     }
 
@@ -871,6 +917,11 @@ impl InstrBuilder {
         let mut instrs = Vec::new();
         let mut idx = block_start + 1;  // Skip the block instruction itself
         while idx < block_end {
+            // Skip completely excluded indices (helper blocks for If)
+            if self.excluded_indices.contains(&idx) {
+                idx += 1;
+                continue;
+            }
             // Check if this index is the start of a consumed range (nested block)
             if let Some(&(start, end)) = self.consumed_ranges.iter().find(|&&(s, _)| s == idx) {
                 // Include the nested block itself, but skip its contents
@@ -888,6 +939,11 @@ impl InstrBuilder {
     fn mark_consumed(&mut self, start: usize, end: usize) {
         self.consumed_ranges.push((start, end));
     }
+
+    /// Exclude an index completely from all instruction lists (for helper blocks)
+    fn exclude_index(&mut self, idx: usize) {
+        self.excluded_indices.insert(idx);
+    }
 }
 
 fn convert_instructions(
@@ -900,7 +956,7 @@ fn convert_instructions(
 
     // Create an implicit entry block that wraps the whole function
     let entry_block_idx = builder.current_idx();
-    builder.block_stack.push((entry_block_idx, false, BlockType::TypeIdx(func_type_idx)));
+    builder.block_stack.push((entry_block_idx, BlockKind::Block, BlockType::TypeIdx(func_type_idx)));
 
     // Reserve space for the entry block (we'll fill it in at the end)
     builder.emit(Instruction::Nop); // Placeholder
@@ -946,7 +1002,7 @@ fn convert_single_instruction(
         WI::Block(bt) => {
             let block_type = convert_block_type(bt, types)?;
             let block_start = builder.current_idx();
-            builder.block_stack.push((block_start, false, block_type));
+            builder.block_stack.push((block_start, BlockKind::Block, block_type));
             // Reserve space for the block instruction
             builder.emit(Instruction::Nop);
         }
@@ -954,41 +1010,36 @@ fn convert_single_instruction(
         WI::Loop(bt) => {
             let block_type = convert_block_type(bt, types)?;
             let block_start = builder.current_idx();
-            builder.block_stack.push((block_start, true, block_type));
+            builder.block_stack.push((block_start, BlockKind::Loop, block_type));
             builder.emit(Instruction::Nop);
         }
 
         WI::If(bt) => {
             let block_type = convert_block_type(bt, types)?;
             let block_start = builder.current_idx();
-            // We'll handle If specially - push a marker
-            builder.block_stack.push((block_start, false, block_type));
+            builder.block_stack.push((block_start, BlockKind::If { else_idx: None }, block_type));
             // Reserve space for the If instruction
             builder.emit(Instruction::Nop);
         }
 
         WI::Else(_) => {
-            // Mark the else branch - we'll handle this when we see End
-            // For now, just note where else starts
-            // This is tricky - we need to track the else position
+            // Mark the else position in the current if block
+            let idx = builder.current_idx();
+            if let Some((_, BlockKind::If { else_idx }, _)) = builder.block_stack.last_mut() {
+                *else_idx = Some(idx);
+            }
         }
 
         WI::End(_) => {
-            // Close the current block (this is an inner block with an enclosing block)
-            if let Some((block_start, is_loop, block_type)) = builder.block_stack.pop() {
+            // Close the current block
+            if let Some((block_start, kind, block_type)) = builder.block_stack.pop() {
                 let block_end = builder.current_idx();
 
-                // Collect direct child instructions, skipping nested block contents
-                let instrs = builder.collect_instrs(block_start, block_end);
-
-                // For inner blocks, next points to after this block in the parent
-                // We need to calculate the index considering consumed ranges
+                // Calculate next location for branching
                 let next_loc = if let Some((parent_start, _, _)) = builder.block_stack.last() {
-                    // Count how many direct children come before this block in the parent
                     let mut parent_instr_idx = 0u32;
                     let mut idx = *parent_start + 1;
                     while idx < block_start {
-                        // Check if this index is the start of a consumed range
                         if let Some(&(_, end)) = builder.consumed_ranges.iter().find(|&&(s, _)| s == idx) {
                             idx = end;
                         } else {
@@ -996,31 +1047,71 @@ fn convert_single_instruction(
                             idx += 1;
                         }
                     }
-                    // After this block is at parent_instr_idx + 1
                     FuncLoc {
                         block_id: NodeIdx(*parent_start as u32),
                         instr_idx: parent_instr_idx + 1,
                     }
                 } else {
-                    // This is the entry block (no parent), should have next: None
-                    FuncLoc {
-                        block_id: NodeIdx(0),
-                        instr_idx: 0,
-                    }
+                    FuncLoc { block_id: NodeIdx(0), instr_idx: 0 }
                 };
 
-                // Mark this block's range as consumed
                 builder.mark_consumed(block_start, block_end);
 
-                let block = BlockInst {
-                    block_type,
-                    instrs,
-                    is_loop,
-                    next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
-                };
+                match kind {
+                    BlockKind::If { else_idx } => {
+                        // Create then and else blocks
+                        let else_start = else_idx.unwrap_or(block_end);
+                        let then_instrs = builder.collect_instrs(block_start, else_start);
+                        // For else, don't skip the first instruction (no block header to skip)
+                        let else_instrs: Vec<NodeIdx> = (else_start..block_end)
+                            .map(|i| NodeIdx(i as u32))
+                            .collect();
 
-                // Replace the placeholder at block_start
-                builder.body[block_start] = Instruction::Block(Box::new(block));
+                        // Create then block
+                        let then_block_idx = builder.body.len();
+                        let then_block = BlockInst {
+                            block_type: block_type.clone(),
+                            instrs: then_instrs,
+                            is_loop: false,
+                            next: if builder.block_stack.is_empty() { None } else { Some(next_loc.clone()) },
+                        };
+                        builder.body.push(Instruction::Block(Box::new(then_block)));
+
+                        // Create else block
+                        let else_block_idx = builder.body.len();
+                        let else_block = BlockInst {
+                            block_type: block_type.clone(),
+                            instrs: else_instrs,
+                            is_loop: false,
+                            next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
+                        };
+                        builder.body.push(Instruction::Block(Box::new(else_block)));
+
+                        // Exclude helper blocks from all parent instruction lists
+                        builder.exclude_index(then_block_idx);
+                        builder.exclude_index(else_block_idx);
+
+                        // Create the If instruction
+                        let if_inst = IfInst {
+                            block_type,
+                            then_block: NodeIdx(then_block_idx as u32),
+                            else_block: NodeIdx(else_block_idx as u32),
+                            next: FuncLoc { block_id: NodeIdx(0), instr_idx: 0 }, // Not used
+                        };
+                        builder.body[block_start] = Instruction::If(Box::new(if_inst));
+                    }
+                    BlockKind::Block | BlockKind::Loop => {
+                        let instrs = builder.collect_instrs(block_start, block_end);
+                        let is_loop = matches!(kind, BlockKind::Loop);
+                        let block = BlockInst {
+                            block_type,
+                            instrs,
+                            is_loop,
+                            next: if builder.block_stack.is_empty() { None } else { Some(next_loc) },
+                        };
+                        builder.body[block_start] = Instruction::Block(Box::new(block));
+                    }
+                }
             }
         }
 
@@ -1262,11 +1353,10 @@ fn convert_single_instruction(
 fn finalize_blocks(builder: &mut InstrBuilder) -> Result<(), ParseError> {
     // Close remaining blocks (should just be the entry block)
     // The entry block has next: None to indicate implicit return when it completes
-    while let Some((block_start, is_loop, block_type)) = builder.block_stack.pop() {
+    while let Some((block_start, kind, block_type)) = builder.block_stack.pop() {
         let block_end = builder.current_idx();
-
-        // Collect direct child instructions, skipping nested block contents
         let instrs = builder.collect_instrs(block_start, block_end);
+        let is_loop = matches!(kind, BlockKind::Loop);
 
         let block = BlockInst {
             block_type,
@@ -1376,6 +1466,8 @@ fn convert_core_arg(arg: &wast::core::WastArgCore) -> Option<Value> {
         wast::core::WastArgCore::I64(v) => Some(Value::I64(*v)),
         wast::core::WastArgCore::F32(v) => Some(Value::F32(f32::from_bits(v.bits))),
         wast::core::WastArgCore::F64(v) => Some(Value::F64(f64::from_bits(v.bits))),
+        wast::core::WastArgCore::RefExtern(v) => Some(Value::Ref(*v as u64)),
+        wast::core::WastArgCore::RefNull(_) => Some(Value::Ref(0)),
         _ => None,
     }
 }
@@ -1394,6 +1486,8 @@ fn convert_core_ret(arg: &wast::core::WastRetCore) -> Option<Value> {
             wast::core::NanPattern::CanonicalNan => Some(Value::F64(f64::NAN)),
             wast::core::NanPattern::ArithmeticNan => Some(Value::F64(f64::NAN)),
         },
+        wast::core::WastRetCore::RefExtern(v) => Some(Value::Ref(v.unwrap_or(0) as u64)),
+        wast::core::WastRetCore::RefNull(_) => Some(Value::Ref(0)),
         _ => None,
     }
 }
